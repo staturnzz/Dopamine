@@ -53,6 +53,31 @@ int reboot3(uint64_t flags, ...);
     return self;
 }
 
+- (NSString *)nightlyHash
+{
+#ifdef NIGHTLY
+    return [NSString stringWithUTF8String:COMMIT_HASH];
+#else
+    return nil;
+#endif
+}
+
+- (NSString *)appVersion
+{
+    return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+}
+
+- (NSString *)appVersionDisplayString
+{
+    NSString *nightlyHash = [self nightlyHash];
+    if (nightlyHash) {
+        return [NSString stringWithFormat:@"%@~%@", self.appVersion, [nightlyHash substringToIndex:6]];
+    }
+    else {
+        return [self appVersion];
+    }
+}
+
 - (NSData *)bootManifestHash
 {
     if (!_bootManifestHash) {
@@ -239,7 +264,7 @@ int reboot3(uint64_t flags, ...);
 {
     uint32_t orgUser = getuid();
     uint32_t orgGroup = getgid();
-    if (orgUser == 0 && orgGroup == 0) {
+    if (geteuid() == 0 && orgGroup == 0) {
         rootBlock();
         return;
     }
@@ -314,6 +339,22 @@ int reboot3(uint64_t flags, ...);
     }];
 }
 
+- (void)unregisterJailbreakApps
+{
+    [self runAsRoot:^{
+        [self runUnsandboxed:^{
+            NSArray *jailbreakApps = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:NSJBRootPath(@"/Applications") error:nil];
+            if (jailbreakApps.count) {
+                for (NSString *jailbreakApp in jailbreakApps) {
+                    NSString *jailbreakAppPath = [NSJBRootPath(@"/Applications") stringByAppendingPathComponent:jailbreakApp];
+                    exec_cmd(JBRootPath("/usr/bin/uicache"), "-u", jailbreakAppPath.fileSystemRepresentation, NULL);
+                }
+                
+            }
+        }];
+    }];
+}
+
 - (void)reboot
 {
     [self runAsRoot:^{
@@ -370,25 +411,69 @@ int reboot3(uint64_t flags, ...);
 
 - (BOOL)isIDownloadEnabled
 {
-    return [[NSFileManager defaultManager] fileExistsAtPath:NSJBRootPath(@"/basebin/.idownloadd_enabled")];
+    __block BOOL isEnabled = NO;
+    [self runAsRoot:^{
+        [self runUnsandboxed:^{
+            NSDictionary *disabledDict = [NSDictionary dictionaryWithContentsOfFile:@"/var/db/com.apple.xpc.launchd/disabled.plist"];
+            NSNumber *idownloaddDisabledNum = disabledDict[@"com.opa334.Dopamine.idownloadd"];
+            if (idownloaddDisabledNum) {
+                isEnabled = ![idownloaddDisabledNum boolValue];
+            }
+            else {
+                isEnabled = NO;
+            }
+        }];
+    }];
+    return isEnabled;
 }
 
-- (void)setIDownloadEnabled:(BOOL)enabled
+- (void)setIDownloadEnabled:(BOOL)enabled needsUnsandbox:(BOOL)needsUnsandbox
 {
-    NSString *idownloaddEnabledPath = NSJBRootPath(@"/basebin/.idownloadd_enabled");
-    if ([self isJailbroken]) {
+    void (^updateBlock)(void) = ^{
+        if (enabled) {
+            exec_cmd_trusted(JBRootPath("/usr/bin/launchctl"), "enable", "system/com.opa334.Dopamine.idownloadd", NULL);
+        }
+        else {
+            exec_cmd_trusted(JBRootPath("/usr/bin/launchctl"), "disable", "system/com.opa334.Dopamine.idownloadd", NULL);
+        }
+    };
+
+    if (needsUnsandbox) {
         [self runAsRoot:^{
-            [self runUnsandboxed:^{
-                if (enabled) {
-                    [[NSData data] writeToFile:idownloaddEnabledPath atomically:YES];
-                    exec_cmd(JBRootPath("/usr/bin/launchctl"), "load", JBRootPath("/basebin/LaunchDaemons/com.opa334.Dopamine.idownloadd.plist"), NULL);
-                }
-                else {
-                    [[NSFileManager defaultManager] removeItemAtPath:idownloaddEnabledPath error:nil];
-                    exec_cmd(JBRootPath("/usr/bin/launchctl"), "unload", JBRootPath("/basebin/LaunchDaemons/com.opa334.Dopamine.idownloadd.plist"), NULL);
-                }
-            }];
+            [self runUnsandboxed:updateBlock];
         }];
+    }
+    else {
+        updateBlock();
+    }
+}
+
+- (void)setIDownloadLoaded:(BOOL)loaded needsUnsandbox:(BOOL)needsUnsandbox
+{
+    if (loaded) {
+        [self setIDownloadEnabled:loaded needsUnsandbox:needsUnsandbox];
+    }
+    
+    void (^updateBlock)(void) = ^{
+        if (loaded) {
+            exec_cmd(JBRootPath("/usr/bin/launchctl"), "load", JBRootPath("/basebin/LaunchDaemons/com.opa334.Dopamine.idownloadd.plist"), NULL);
+        }
+        else {
+            exec_cmd(JBRootPath("/usr/bin/launchctl"), "unload", JBRootPath("/basebin/LaunchDaemons/com.opa334.Dopamine.idownloadd.plist"), NULL);
+        }
+    };
+    
+    if (needsUnsandbox) {
+        [self runAsRoot:^{
+            [self runUnsandboxed:updateBlock];
+        }];
+    }
+    else {
+        updateBlock();
+    }
+    
+    if (!loaded) {
+        [self setIDownloadEnabled:loaded needsUnsandbox:needsUnsandbox];
     }
 }
 
@@ -408,16 +493,20 @@ int reboot3(uint64_t flags, ...);
         BOOL alreadyHidden = [self isJailbreakHidden];
         if (hidden != alreadyHidden) {
             if (hidden) {
-                [[NSFileManager defaultManager] removeItemAtPath:@"/var/jb" error:nil];
                 if ([self isJailbroken]) {
+                    [self unregisterJailbreakApps];
                     [[NSFileManager defaultManager] removeItemAtPath:NSJBRootPath(@"/basebin/.fakelib/systemhook.dylib") error:nil];
                     carbonCopy(NSJBRootPath(@"/basebin/.dyld.orig"), NSJBRootPath(@"/basebin/.fakelib/dyld"));
                 }
+                [[NSFileManager defaultManager] removeItemAtPath:@"/var/jb" error:nil];
             }
             else {
                 [[NSFileManager defaultManager] createSymbolicLinkAtPath:@"/var/jb" withDestinationPath:NSJBRootPath(@"/") error:nil];
-                carbonCopy(NSJBRootPath(@"/basebin/.dyld.patched"), NSJBRootPath(@"/basebin/.fakelib/dyld"));
-                carbonCopy(NSJBRootPath(@"/basebin/systemhook.dylib"), NSJBRootPath(@"/basebin/.fakelib/systemhook.dylib"));
+                if ([self isJailbroken]) {
+                    carbonCopy(NSJBRootPath(@"/basebin/.dyld.patched"), NSJBRootPath(@"/basebin/.fakelib/dyld"));
+                    carbonCopy(NSJBRootPath(@"/basebin/systemhook.dylib"), NSJBRootPath(@"/basebin/.fakelib/systemhook.dylib"));
+                    [self refreshJailbreakApps];
+                }
             }
         }
     };
@@ -436,7 +525,10 @@ int reboot3(uint64_t flags, ...);
 {
     if ([self isInstalledThroughTrollStore]) {
         NSString *kernelcachePath = [[self activePrebootPath] stringByAppendingPathComponent:@"System/Library/Caches/com.apple.kernelcaches/kernelcache"];
-        return kernelcachePath;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:kernelcachePath]) {
+            return kernelcachePath;
+        }
+        return @"/System/Library/Caches/com.apple.kernelcaches/kernelcache";
     }
     else {
         NSString *kernelInApp = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"kernelcache"];
@@ -538,5 +630,6 @@ int reboot3(uint64_t flags, ...);
     }];
     return error;
 }
+
 
 @end

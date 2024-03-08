@@ -26,6 +26,7 @@
     if (self = [super init]){
         _preferenceManager = [DOPreferenceManager sharedManager];
         _logRecord = [NSMutableArray new];
+        _logLock = [NSLock new];
     }
     return self;
 }
@@ -207,14 +208,19 @@
 
 - (void)sendLog:(NSString*)log debug:(BOOL)debug update:(BOOL)update
 {
-    if (!self.logView)
+    if (!self.logView || !log)
         return;
-    
+
+    [_logLock lock];
+
     [self.logRecord addObject:log];
 
     BOOL isDebug = self.logView.class == DODebugLogView.class;
-    if (debug && !isDebug)
+    if (debug && !isDebug) {
+        [_logLock unlock];
         return;
+    }
+        
     
     if (update) {
         if ([self.logView respondsToSelector:@selector(updateLog:)]) {
@@ -224,6 +230,7 @@
     else {
         [self.logView showLog:log];
     }
+    [_logLock unlock];
 }
 
 - (void)sendLog:(NSString*)log debug:(BOOL)debug
@@ -273,12 +280,15 @@
 
         while ((bytes_read = read(stdout_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
             @autoreleasepool {
+                // Tee: Write back to the original standard output
+                write(stdout_orig[1], buffer, bytes_read);
+
                 buffer[bytes_read] = '\0'; // Null terminate to handle as string
                 for (int i = 0; i < bytes_read; ++i) {
                     if (buffer[i] == '\n') {
                         line[line_index] = '\0';
                         NSString *str = [NSString stringWithUTF8String:line];
-                        [[DOUIManager sharedInstance] sendLog:str debug:YES];
+                        [self sendLog:str debug:YES];
                         line_index = 0;
                     } else {
                         if (line_index < sizeof(line) - 1) {
@@ -286,8 +296,6 @@
                         }
                     }
                 }
-                // Tee: Write back to the original standard output
-                write(stdout_orig[1], buffer, bytes_read);
             }
         }
         close(stdout_pipe[0]);

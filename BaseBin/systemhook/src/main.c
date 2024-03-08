@@ -9,6 +9,21 @@
 #include "objc.h"
 #include <libjailbreak/jbclient_xpc.h>
 #include <libjailbreak/codesign.h>
+#include "litehook.h"
+
+int necp_match_policy(uint8_t *parameters, size_t parameters_size, void *returned_result);
+int necp_open(int flags);
+int necp_client_action(int necp_fd, uint32_t action, uuid_t client_id, size_t client_id_len, uint8_t *buffer, size_t buffer_size);
+int necp_session_open(int flags);
+int necp_session_action(int necp_fd, uint32_t action, uint8_t *in_buffer, size_t in_buffer_length, uint8_t *out_buffer, size_t out_buffer_length);
+
+#define SYSCALL_CSOPS 0xA9
+#define SYSCALL_CSOPS_AUDITTOKEN 0xAA
+#define SYSCALL_NECP_MATCH_POLICY 0x1CC
+#define SYSCALL_NECP_OPEN 0x1F5
+#define SYSCALL_NECP_CLIENT_ACTION 0x1F6
+#define SYSCALL_NECP_SESSION_OPEN 0x20A
+#define SYSCALL_NECP_SESSION_ACTION 0x20B
 
 #define JBRootPath(path) ({ \
 	char *outPath = alloca(PATH_MAX); \
@@ -63,7 +78,7 @@ int posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 					   char *const argv[restrict],
 					   char *const envp[restrict])
 {
-	return spawn_hook_common(pid, path, file_actions, attrp, argv, envp, (void *)posix_spawn, jbclient_trust_binary);
+	return spawn_hook_common(pid, path, file_actions, attrp, argv, envp, (void *)posix_spawn, jbclient_trust_binary, jbclient_platform_set_process_debugged);
 }
 
 int posix_spawnp_hook(pid_t *restrict pid, const char *restrict file,
@@ -73,7 +88,7 @@ int posix_spawnp_hook(pid_t *restrict pid, const char *restrict file,
 					   char *const envp[restrict])
 {
 	return resolvePath(file, NULL, ^int(char *path) {
-		return spawn_hook_common(pid, path, file_actions, attrp, argv, envp, (void *)posix_spawn, jbclient_trust_binary);
+		return spawn_hook_common(pid, path, file_actions, attrp, argv, envp, (void *)posix_spawn, jbclient_trust_binary, jbclient_platform_set_process_debugged);
 	});
 }
 
@@ -83,7 +98,7 @@ int execve_hook(const char *path, char *const argv[], char *const envp[])
 	posix_spawnattr_t attr = NULL;
 	posix_spawnattr_init(&attr);
 	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC);
-	int result = spawn_hook_common(NULL, path, NULL, &attr, argv, envp, (void *)posix_spawn, jbclient_trust_binary);
+	int result = spawn_hook_common(NULL, path, NULL, &attr, argv, envp, (void *)posix_spawn, jbclient_trust_binary, jbclient_platform_set_process_debugged);
 	if (attr) {
 		posix_spawnattr_destroy(&attr);
 	}
@@ -279,12 +294,14 @@ int ptrace_hook(int request, pid_t pid, caddr_t addr, int data)
 	// but when the victim process does not have the get-task-allow entitlement,
 	// it will fail to set the debug flags, therefore we patch ptrace to manually apply them
 	if (retval == 0 && (request == PT_ATTACHEXC || request == PT_ATTACH)) {
-		jbclient_platform_set_process_debugged(pid);
-		jbclient_platform_set_process_debugged(getpid());
+		jbclient_platform_set_process_debugged(pid, true);
+		jbclient_platform_set_process_debugged(getpid(), true);
 	}
 
 	return retval;
 }
+
+#ifdef __arm64e__
 
 void loadForkFix(void)
 {
@@ -324,46 +341,75 @@ int daemon_hook(int __nochdir, int __noclose)
 	return daemon(__nochdir, __noclose);
 }
 
-static void (*MSHookFunction)(void *symbol, void *replace, void **result) = NULL;
-int (*csops_orig)(pid_t pid, unsigned int ops, void * useraddr, size_t usersize);
-int csops_hook(pid_t pid, unsigned int ops, void * useraddr, size_t usersize)
+#else
+
+// The NECP subsystem is the only thing in the kernel that ever checks CS_VALID on userspace processes (Only on iOS 16)
+// In order to not break system functionality, we need to readd CS_VALID before any of these are invoked
+
+int necp_match_policy_hook(uint8_t *parameters, size_t parameters_size, void *returned_result)
 {
-	int rv = csops_orig(pid, ops, useraddr, usersize);
-	if (rv) return rv;
+	jbclient_cs_revalidate();
+	return syscall(SYSCALL_NECP_MATCH_POLICY, parameters, parameters_size, returned_result);
+}
+
+int necp_open_hook(int flags)
+{
+	jbclient_cs_revalidate();
+	return syscall(SYSCALL_NECP_OPEN, flags);
+}
+
+int necp_client_action_hook(int necp_fd, uint32_t action, uuid_t client_id, size_t client_id_len, uint8_t *buffer, size_t buffer_size)
+{
+	jbclient_cs_revalidate();
+	return syscall(SYSCALL_NECP_CLIENT_ACTION, necp_fd, action, client_id, client_id_len, buffer, buffer_size);
+}
+
+int necp_session_open_hook(int flags)
+{
+	jbclient_cs_revalidate();
+	return syscall(SYSCALL_NECP_SESSION_OPEN, flags);
+}
+
+int necp_session_action_hook(int necp_fd, uint32_t action, uint8_t *in_buffer, size_t in_buffer_length, uint8_t *out_buffer, size_t out_buffer_length)
+{
+	jbclient_cs_revalidate();
+	return syscall(SYSCALL_NECP_SESSION_ACTION, necp_fd, action, in_buffer, in_buffer_length, out_buffer, out_buffer_length);
+}
+
+// For the userland, there are multiple processes that will check CS_VALID for one reason or another
+// As we inject system wide (or at least almost system wide), we can just patch the source of the info though - csops itself
+// Additionally we also remove CS_DEBUGGED while we're at it, as on arm64e this also is not set and everything is fine
+// That way we have unified behaviour between both arm64 and arm64e
+
+int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
+{
+	int rv = syscall(SYSCALL_CSOPS, pid, ops, useraddr, usersize);
+	if (rv != 0) return rv;
 	if (ops == CS_OPS_STATUS) {
-		if (useraddr) {
-			uint32_t* csflag = (uint32_t*)useraddr;
-			csflag[0] |= CS_VALID;
+		if (useraddr && usersize == sizeof(uint32_t)) {
+			uint32_t* csflag = (uint32_t *)useraddr;
+			*csflag |= CS_VALID;
+			*csflag &= ~CS_DEBUGGED;
 		}
 	}
 	return rv;
 }
 
-int (*csops_audittoken_orig)(pid_t pid, unsigned int ops, void * useraddr, size_t usersize, audit_token_t * token);
-int csops_audittoken_hook(pid_t pid, unsigned int ops, void * useraddr, size_t usersize, audit_token_t * token)
+int csops_audittoken_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize, audit_token_t *token)
 {
-	int rv = csops_audittoken_orig(pid, ops, useraddr, usersize, token);
-	if (rv) return rv;
+	int rv = syscall(SYSCALL_CSOPS_AUDITTOKEN, pid, ops, useraddr, usersize, token);
+	if (rv != 0) return rv;
 	if (ops == CS_OPS_STATUS) {
-		if (useraddr) {
-			uint32_t* csflag = (uint32_t*)useraddr;
-			csflag[0] |= CS_VALID;
+		if (useraddr && usersize == sizeof(uint32_t)) {
+			uint32_t* csflag = (uint32_t *)useraddr;
+			*csflag |= CS_VALID;
+			*csflag &= ~CS_DEBUGGED;
 		}
 	}
 	return rv;
 }
 
-void enable_csops_fix(void)
-{
-	void *handle = dlopen(JBRootPath("/usr/lib/libellekit.dylib"), RTLD_NOLOAD);
-	if (handle) {
-		MSHookFunction = dlsym(handle, "MSHookFunction");
-		if (MSHookFunction) {
-			MSHookFunction((void *)csops, (void *)csops_hook, (void **)&csops_orig);
-			MSHookFunction((void *)csops_audittoken, (void *)csops_audittoken_hook, (void **)&csops_audittoken_orig);
-		}
-	}
-}
+#endif
 
 bool shouldEnableTweaks(void)
 {
@@ -385,9 +431,20 @@ bool shouldEnableTweaks(void)
 		// Dopamine app itself (jailbreak detection bypass tweaks can break it)
 		"Dopamine.app/Dopamine",
 	};
-	for (size_t i = 0; i < sizeof(tweaksDisabledPathSuffixes) / sizeof(const char*); i++)
-	{
+	for (size_t i = 0; i < sizeof(tweaksDisabledPathSuffixes) / sizeof(const char*); i++) {
 		if (stringEndsWith(gExecutablePath, tweaksDisabledPathSuffixes[i])) return false;
+	}
+
+	if (__builtin_available(iOS 16.0, *)) {
+		// These seem to be problematic on iOS 16+ (dyld gets stuck in a weird way when opening TweakLoader)
+		const char *iOS16TweaksDisabledPaths[] = {
+			"/usr/libexec/logd",
+			"/usr/sbin/notifyd",
+			"/usr/libexec/usermanagerd",
+		};
+		for (size_t i = 0; i < sizeof(iOS16TweaksDisabledPaths) / sizeof(const char*); i++) {
+			if (!strcmp(gExecutablePath, iOS16TweaksDisabledPaths[i])) return false;
+		}
 	}
 
 	return true;
@@ -416,6 +473,21 @@ __attribute__((constructor)) static void initializer(void)
 			dlopen_hook(JBRootPath("/basebin/watchdoghook.dylib"), RTLD_NOW);
 		}
 
+#ifndef __arm64e__
+		// On arm64, writing to executable pages removes CS_VALID from the csflags of the process
+		// These hooks are neccessary to get the system to behave with this
+		// They're ugly but they're needed
+		litehook_hook_function(csops, csops_hook);
+		litehook_hook_function(csops_audittoken, csops_audittoken_hook);
+		if (__builtin_available(iOS 16.0, *)) {
+			litehook_hook_function(necp_match_policy, necp_match_policy_hook);
+			litehook_hook_function(necp_open, necp_open_hook);
+			litehook_hook_function(necp_client_action, necp_client_action_hook);
+			litehook_hook_function(necp_session_open, necp_session_open_hook);
+			litehook_hook_function(necp_session_action, necp_session_action_hook);
+		}
+#endif
+
 		if (shouldEnableTweaks()) {
 			const char *tweakLoaderPath = "/var/jb/usr/lib/TweakLoader.dylib";
 			if(access(tweakLoaderPath, F_OK) == 0) {
@@ -423,14 +495,18 @@ __attribute__((constructor)) static void initializer(void)
 				void *tweakLoaderHandle = dlopen_hook(tweakLoaderPath, RTLD_NOW);
 				if (tweakLoaderHandle != NULL) {
 					dlclose(tweakLoaderHandle);
-#ifndef __arm64e__
-					// Always set CS_VALID in csflag to avoid causing a crash when hooking a c function on arm64
-					enable_csops_fix();
-#endif
 					dopamine_fix_NSTask();
 				}
 			}
 		}
+
+#ifndef __arm64e__
+		// Feeable attempt at adding back CS_VALID
+		// If any hooks are applied after this, it is lost again
+		// Temporary workaround until a better solution for this problem is found
+		// This + the csops hook should resolve all cases unless a tweak does something really stupid
+		jbclient_cs_revalidate();
+#endif
 	}
 }
 

@@ -20,6 +20,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, readonly) NSData *bootManifestHash;
 
+- (NSString *)appVersion;
+- (NSString *)appVersionDisplayString;
+- (NSString *)nightlyHash;
+
 - (BOOL)isInstalledThroughTrollStore;
 - (BOOL)isJailbroken;
 - (BOOL)isBootstrapped;
@@ -46,7 +50,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)isTweakInjectionEnabled;
 - (void)setTweakInjectionEnabled:(BOOL)enabled;
 - (BOOL)isIDownloadEnabled;
-- (void)setIDownloadEnabled:(BOOL)enabled;
+- (void)setIDownloadEnabled:(BOOL)enabled needsUnsandbox:(BOOL)needsUnsandbox;
+- (void)setIDownloadLoaded:(BOOL)loaded needsUnsandbox:(BOOL)needsUnsandbox;
 - (BOOL)isJailbreakHidden;
 - (void)setJailbreakHidden:(BOOL)hidden;
 

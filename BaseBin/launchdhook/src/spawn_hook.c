@@ -10,6 +10,7 @@
 extern char **environ;
 
 extern int systemwide_trust_binary(const char *binaryPath);
+extern int platform_set_process_debugged(uint64_t pid, bool fullyDebugged);
 
 #define LOG_PROCESS_LAUNCHES 0
 
@@ -66,15 +67,13 @@ int posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 			if (stagedJailbreakUpdate) {
 				int r = jbupdate_basebin(stagedJailbreakUpdate);
 				unsetenv("STAGED_JAILBREAK_UPDATE");
-
-				// Update envp to reflect our changes
-				// setenv / unsetenv can sometimes cause environ to get reallocated
-				// In that case envp may point to garbage or be empty
-				envp = environ;
 			}
 
+			// Always use environ instead of envp, as boomerang_stashPrimitives calls setenv
+			// setenv / unsetenv can sometimes cause environ to get reallocated
+			// In that case envp may point to garbage or be empty
 			// Say goodbye to this process
-			return posix_spawn_orig_wrapper(pid, path, file_actions, attrp, argv, envp);
+			return posix_spawn_orig_wrapper(pid, path, file_actions, attrp, argv, environ);
 		}
 	}
 
@@ -128,7 +127,7 @@ int posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 		}
 	}
 
-	return spawn_hook_common(pid, path, file_actions, attrp, argv, envp, posix_spawn_orig_wrapper, systemwide_trust_binary);
+	return spawn_hook_common(pid, path, file_actions, attrp, argv, envp, posix_spawn_orig_wrapper, systemwide_trust_binary, platform_set_process_debugged);
 }
 
 void initSpawnHooks(void)

@@ -41,6 +41,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     BootstrapErrorCodeFailedExtracting          = -4,
     BootstrapErrorCodeFailedRemount             = -5,
     BootstrapErrorCodeFailedFinalising          = -6,
+    BootstrapErrorCodeFailedReplacing           = -7,
 };
 
 #define BUFFER_SIZE 8192
@@ -207,13 +208,14 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     return nil;
 }
 
-- (void)deleteSymlinkAtPath:(NSString *)path
+- (BOOL)deleteSymlinkAtPath:(NSString *)path error:(NSError **)error
 {
-    NSDictionary<NSFileAttributeKey, id> *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    if (!attributes) return;
+    NSDictionary<NSFileAttributeKey, id> *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:error];
+    if (!attributes) return YES;
     if (attributes[NSFileType] == NSFileTypeSymbolicLink) {
-        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        return [[NSFileManager defaultManager] removeItemAtPath:path error:error];
     }
+    return NO;
 }
 
 - (BOOL)fileOrSymlinkExistsAtPath:(NSString *)path
@@ -230,15 +232,17 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     return NO;
 }
 
-- (BOOL)createSymlinkAtPath:(NSString *)path toPath:(NSString *)destinationPath createIntermediateDirectories:(BOOL)createIntermediate
+- (NSError *)createSymlinkAtPath:(NSString *)path toPath:(NSString *)destinationPath createIntermediateDirectories:(BOOL)createIntermediate
 {
+    NSError *error;
     NSString *parentPath = [path stringByDeletingLastPathComponent];
     if (![[NSFileManager defaultManager] fileExistsAtPath:parentPath]) {
-        if (!createIntermediate) return NO;
-        if (![[NSFileManager defaultManager] createDirectoryAtPath:parentPath withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
+        if (!createIntermediate) return [NSError errorWithDomain:bootstrapErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed create %@->%@ symlink: Parent dir does not exists", path, destinationPath]}];
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:parentPath withIntermediateDirectories:YES attributes:nil error:&error]) return error;
     }
     
-    return [[NSFileManager defaultManager] createSymbolicLinkAtPath:path withDestinationPath:destinationPath error:nil];
+    [[NSFileManager defaultManager] createSymbolicLinkAtPath:path withDestinationPath:destinationPath error:&error];
+    return error;
 }
 
 - (BOOL)isPrivatePrebootMountedWritable
@@ -279,8 +283,15 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 
 - (void)fixupPathPermissions
 {
+    // Ensure the following paths are owned by root:wheel and have permissions of 755:
+    // /private
+    // /private/preboot
+    // /private/preboot/UUID
+    // /private/preboot/UUID/dopamine-<UUID>
+    // /private/preboot/UUID/dopamine-<UUID>/procursus
+
     NSString *tmpPath = NSJBRootPath(@"/");
-    while (![tmpPath isEqualToString:@"/private/preboot"]) {
+    while (![tmpPath isEqualToString:@"/"]) {
         struct stat s;
         stat(tmpPath.fileSystemRepresentation, &s);
         if (s.st_uid != 0 || s.st_gid != 0) {
@@ -385,7 +396,18 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     }
     
     // Remove /var/jb as it might be wrong
-    [self deleteSymlinkAtPath:@"/var/jb"];
+    if (![self deleteSymlinkAtPath:@"/var/jb" error:&error]) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"]) {
+            if (![[NSFileManager defaultManager] removeItemAtPath:@"/var/jb" error:&error]) {
+                completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedReplacing userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Removing /var/jb directory failed with error: %@", error]}]);
+                return;
+            }
+        }
+        else {
+            completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedReplacing userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Removing /var/jb symlink failed with error: %@", error]}]);
+            return;
+        }
+    }
     
     // Clean up xinaA15 v1 leftovers if desired
     if (![[NSFileManager defaultManager] fileExistsAtPath:@"/var/.keep_symlinks"]) {
@@ -432,7 +454,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
         ];
         
         for (NSString *xinaLeftoverSymlink in xinaLeftoverSymlinks) {
-            [self deleteSymlinkAtPath:xinaLeftoverSymlink];
+            [self deleteSymlinkAtPath:xinaLeftoverSymlink error:nil];
         }
         
         for (NSString *xinaLeftoverFile in xinaLeftoverFiles) {
@@ -444,7 +466,11 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     
     NSString *basebinPath = NSJBRootPath(@"/basebin");
     NSString *installedPath = NSJBRootPath(@"/.installed_dopamine");
-    [self createSymlinkAtPath:@"/var/jb" toPath:NSJBRootPath(@"/") createIntermediateDirectories:YES];
+    error = [self createSymlinkAtPath:@"/var/jb" toPath:NSJBRootPath(@"/") createIntermediateDirectories:YES];
+    if (error) {
+        completion(error);
+        return;
+    }
     
     if ([[NSFileManager defaultManager] fileExistsAtPath:basebinPath]) {
         if (![[NSFileManager defaultManager] removeItemAtPath:basebinPath error:&error]) {
